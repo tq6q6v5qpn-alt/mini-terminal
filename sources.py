@@ -22,3 +22,5 @@ def price(sym):
         return float(r.json()["bitcoin"]["usd"])
 
     return None
+def funding(sym):
+    return 0.0
