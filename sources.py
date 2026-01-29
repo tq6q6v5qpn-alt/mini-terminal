@@ -24,3 +24,8 @@ def price(sym):
     return None
 def funding(sym):
     return 0.0
+def oi(sym):
+    return 0.0
+
+def klines(sym):
+    return []
