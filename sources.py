@@ -1,23 +1,24 @@
 import requests
+import time
 
 COINGECKO = "https://api.coingecko.com/api/v3"
 
 def price(sym):
     if sym.upper() != "BTCUSDT":
-        raise ValueError("Only BTCUSDT supported")
-    r = requests.get(
-        f"{COINGECKO}/simple/price",
-        params={"ids": "bitcoin", "vs_currencies": "usd"},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return float(r.json()["bitcoin"]["usd"])
+        return None  # 일단 BTC만
 
-def funding(sym):
-    return 0.0
+    for _ in range(3):  # 최대 3번 재시도
+        r = requests.get(
+            f"{COINGECKO}/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"},
+            timeout=10,
+        )
 
-def oi(sym):
-    return 0.0
+        if r.status_code == 429:
+            time.sleep(5)
+            continue
 
-def klines(sym):
-    return []
+        r.raise_for_status()
+        return float(r.json()["bitcoin"]["usd"])
+
+    return None
