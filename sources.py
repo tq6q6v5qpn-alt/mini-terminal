@@ -1,11 +1,23 @@
 import requests
 
-def get(url,p=None): r=requests.get(url,params=p,timeout=15); r.raise_for_status(); return r.json()
+COINGECKO = "https://api.coingecko.com/api/v3"
 
-def price(sym): return float(get('https://api.binance.com/api/v3/ticker/price',{'symbol':sym})['price'])
+def price(sym):
+    if sym.upper() != "BTCUSDT":
+        raise ValueError("Only BTCUSDT supported")
+    r = requests.get(
+        f"{COINGECKO}/simple/price",
+        params={"ids": "bitcoin", "vs_currencies": "usd"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return float(r.json()["bitcoin"]["usd"])
 
-def funding(sym): return float(get('https://fapi.binance.com/fapi/v1/premiumIndex',{'symbol':sym})['lastFundingRate'])
+def funding(sym):
+    return 0.0
 
-def oi(sym): return float(get('https://fapi.binance.com/fapi/v1/openInterest',{'symbol':sym})['openInterest'])
+def oi(sym):
+    return 0.0
 
-def klines(sym): return get('https://api.binance.com/api/v3/klines',{'symbol':sym,'interval':'5m','limit':30})
+def klines(sym):
+    return []
