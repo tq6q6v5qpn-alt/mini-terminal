@@ -10,13 +10,17 @@ KST=timezone(timedelta(hours=9))
 def d(k,v): p=get_num(k); set_num(k,v,datetime.now(KST).isoformat()); return 0 if p is None else (v-p)/p*100
 
 def run():
- btc=price('BTCUSDT'); eth=price('ETHUSDT')
- f = btc_features()
-r5 = f["r5"]
-vol = f["vol_z"]
-acc = f["acc"]
- m={'BTC_R5':r5,'ETH_R5':d('ETH',eth),'BTC_OI':d('OI',oi('BTCUSDT')),'FUND':funding('BTCUSDT'),'VOL':vol,'ACCEL':acc}
- msg=f"Regime: {regime(m)}\nBTC_R5:{r5:.2f}% VOL:{vol:.2f} ACC:{acc:.2f}"
- send(msg)
+    btc = price('BTCUSDT')
+    eth = price('ETHUSDT')
 
-if __name__=='__main__': run()
+    f = btc_features()
+    r5  = f["r5"]
+    vol = f["vol_z"]
+    acc = f["acc"]
+
+    m = {'BTC_R5': r5, 'ETH_R5': d('ETH', eth), 'VOL': vol, 'ACC': acc}
+    msg = f"Regime: {regime(m)}\nBTC_R5:{r5:.2f}% VOL:{vol:.2f} ACC:{acc:.2f}"
+    send(msg)
+
+if __name__ == "__main__":
+    run()
