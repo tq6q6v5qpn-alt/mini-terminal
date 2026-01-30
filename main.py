@@ -166,17 +166,41 @@ def run():
         for k, v in liq.items():
             if v is not None:
                 m[k] = float(v)
+# --- D/E 축: 변화(Δ)와 가속(ΔΔ) 계산 ---
+for key in ("DGS2", "DGS10", "DTWEX"):
+    v = m.get(key)
+    if v is None:
+        continue
+    d1, d2 = slope_acc(key, float(v))
+    m[key + "_d1"] = d1
+    m[key + "_d2"] = d2
 
+# (선택) 커브(10Y-2Y)도 "축"이라서 같이 보면 훨씬 좋아
+if (m.get("DGS10") is not None) and (m.get("DGS2") is not None):
+    curve = float(m["DGS10"]) - float(m["DGS2"])
+    cd1, cd2 = slope_acc("UST_CURVE_10_2", curve)
+    m["UST_CURVE_10_2"] = curve
+    m["UST_CURVE_10_2_d1"] = cd1
+    m["UST_CURVE_10_2_d2"] = cd2
     msg = (
-        f"[Liquidity Canary]\n"
-        f"Regime: {regime(m)}\n\n"
-        f"[Trigger]\n"
-        f"{trigger_line}\n\n"
-        f"[Momentum]\n"
-        f"BTC_R5={r5:.2f}% | VOL={vol_z:.2f}σ | ACC={acc:.2f}\n\n"
-        f"[Conclusion]\n"
-        f"{conclusion}"
-    )
+    f"[Liquidity Canary]\n"
+    f"Regime: {regime(m)}\n\n"
+
+    f"[Trigger]\n"
+    f"{trigger_line}\n\n"
+
+    f"[Axis]\n"
+    f"DGS2   Δ={m.get('DGS2_d1',0):+7.3f} | ΔΔ={m.get('DGS2_d2',0):+7.3f}\n"
+    f"DGS10  Δ={m.get('DGS10_d1',0):+7.3f} | ΔΔ={m.get('DGS10_d2',0):+7.3f}\n"
+    f"USD    Δ={m.get('DTWEX_d1',0):+7.3f} | ΔΔ={m.get('DTWEX_d2',0):+7.3f}\n"
+    f"Curve  Δ={m.get('UST_CURVE_10_2_d1',0):+7.3f} | ΔΔ={m.get('UST_CURVE_10_2_d2',0):+7.3f}\n\n"
+
+    f"[Momentum]\n"
+    f"BTC_R5={r5:.2f}% | VOL={vol:.2f}σ | ACC={acc:.2f}\n\n"
+
+    f"[Conclusion]\n"
+    f"{conclusion}"
+)
 
     send(msg)
 
