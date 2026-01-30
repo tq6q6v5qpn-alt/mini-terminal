@@ -3,7 +3,7 @@ from state import get_num, set_num
 from sources import price, funding, oi, klines, btc_features
 from analyzer import regime
 from telegram import send
-from fred import liquidity_snapshot
+from fred import liquidity_canary
 
 KST = timezone(timedelta(hours=9))
 
@@ -37,7 +37,7 @@ def run():
     vol = f["vol_z"]
     acc = f["acc"]
 
-    liq = liquidity_snapshot()  # dict 형태(예: {"SOFR":..., "RRP":..., ...})
+    posL, negL, conclL, liq = liquidity_canary()
 
     # === 여기서부터: 상태 변화(Δ)만 저장/계산 ===
     eth_d1, eth_d2 = slope_acc("ETH", eth if eth is not None else 0.0)
@@ -47,16 +47,24 @@ def run():
 
     m = {
         "BTC_R5": r5,
-        "ETH_R5": eth_d1,   # (이름은 임시) 지금은 ETH 가격 변화량을 넣은 상태
+        "ETH_D1": eth_d1,
         "VOL": vol,
         "ACC": acc,
         **(liq or {}),
     }
 
-    msg = (
-        f"Regime: {regime(m)}\n"
-        f"BTC_R5:{r5:.2f}% VOL:{vol:.2f} ACC:{acc:.2f}"
-    )
+    trigger = posL if (posL and "None" not in posL) else negL
+
+msg = (
+    f"[Liquidity Canary]\n"
+    f"Regime: {regime(m)}\n\n"
+    f"[Trigger]\n"
+    f"{trigger}\n\n"
+    f"[Momentum]\n"
+    f"BTC_R5={r5:.2f}% | VOL={vol:.2f}σ | ACC={acc:.2f}\n\n"
+    f"[Conclusion]\n"
+    f"{conclL}"
+)
     send(msg)
 
 
