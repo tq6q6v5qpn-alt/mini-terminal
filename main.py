@@ -68,7 +68,6 @@ def run():
     )
 
     send(msg)
-    send(msg)
 
 
 if __name__ == "__main__":
