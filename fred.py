@@ -1,21 +1,46 @@
 # fred.py
 import os
 import requests
+from datetime import datetime, timezone
+
+from state import get_num, set_num  # ✅ Δ/ΔΔ 저장용
 
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 
 # ===== A: Policy Corridor =====
-SER_SOFR = "SOFR"       # Secured Overnight Financing Rate
-SER_EFFR = "EFFR"       # Effective Federal Funds Rate
-SER_IORB = "IORB"       # Interest on Reserve Balances (FRED에 존재)
+SER_SOFR = "SOFR"
+SER_EFFR = "EFFR"
+SER_IORB = "IORB"
 
 # ===== B: RRP / TGA / Reserves =====
-SER_ONRRP = "ONRRP"     # Overnight Reverse Repurchase Agreements: Treasury Securities Sold by the Fed in the Temporary Open Market Operations
-SER_TGA = "WTREGEN"     # Treasury General Account (TGA)
-SER_RESERVES = "RESBALNS"  # Reserve Balances with Federal Reserve Banks
+SER_ONRRP = "ONRRP"
+SER_TGA = "WTREGEN"
+SER_RESERVES = "RESBALNS"
 
 # ===== C: Repo / Collateral =====
-SER_BGCR = "BGCR"       # Broad General Collateral Rate (TGCR은 사용 안 함)
+SER_BGCR = "BGCR"   # ✅ TGCR 안 씀
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def slope_acc(key: str, v: float):
+    """
+    state에 v 저장하면서
+    d1 = Δ(기울기), d2 = ΔΔ(가속) 계산
+    """
+    prev = get_num(key)
+    prev_d = get_num(key + "_d")
+
+    d1 = (v - prev) if (prev is not None) else 0.0
+    d2 = (d1 - prev_d) if (prev_d is not None) else 0.0
+
+    ts = _now()
+    set_num(key, v, ts)
+    set_num(key + "_d", d1, ts)
+    return d1, d2
+
 
 def _latest(series_id: str):
     api_key = os.getenv("FRED_API_KEY")
@@ -41,12 +66,12 @@ def _latest(series_id: str):
             return None
         return float(v)
     except Exception:
-        # 여기서 죽으면 cronjob이 죽어버리니까, None으로 반환해서 상위에서 처리
         return None
+
 
 def liquidity_snapshot():
     """
-    raw 레벨 값만 가져오는 스냅샷(dict)
+    raw 레벨만
     """
     return {
         "SOFR": _latest(SER_SOFR),
@@ -58,10 +83,13 @@ def liquidity_snapshot():
         "BGCR": _latest(SER_BGCR),
     }
 
+
 def liquidity_canary():
     """
-    A/B/C 트리거 문자열 + 결론 1줄 + (옵션)liq dict 반환
-    - TGCR 없음
+    return: posL, negL, conclL, liq
+    - posL/negL: "A: ... | B: ... | C: ..." 형식
+    - conclL: 1줄 결론 (A/B/C 요약)
+    - liq: raw dict
     """
     liq = liquidity_snapshot()
 
@@ -75,48 +103,155 @@ def liquidity_canary():
 
     bgcr = liq.get("BGCR")
 
-    # -------- A) Policy Corridor --------
-    # 코리더 압력(단순): EFFR이 IORB에 붙거나, SOFR-EFFR 벌어짐
-    # None이면 "None"
-    A = "A: None"
+    # ---------- Δ/ΔΔ 계산(값이 있을 때만) ----------
+    # 단위 주의:
+    # ONRRP/TGA/RESERVES 는 보통 "Millions of Dollars"라서 10,000 = $10B
+    d_onrrp = d2_onrrp = None
+    d_tga = d2_tga = None
+    d_res = d2_res = None
+    d_spread = d2_spread = None
+
+    if onrrp is not None:
+        d_onrrp, d2_onrrp = slope_acc("FRED_ONRRP", onrrp)
+    if tga is not None:
+        d_tga, d2_tga = slope_acc("FRED_TGA", tga)
+    if reserves is not None:
+        d_res, d2_res = slope_acc("FRED_RESERVES", reserves)
+
+    spread_bgcr_sofr = None
+    if (bgcr is not None) and (sofr is not None):
+        spread_bgcr_sofr = bgcr - sofr
+        d_spread, d2_spread = slope_acc("FRED_SPREAD_BGCR_SOFR", spread_bgcr_sofr)
+
+    # =========================================================
+    # A) Policy Corridor (레벨 중심 + 약한 트리거)
+    # =========================================================
+    A_pos = "A: None"
+    A_neg = "A: None"
     concA = "A: 데이터 없음"
+
     if (sofr is not None) and (effr is not None) and (iorb is not None):
         spread_sofr_effr = sofr - effr
-        spread_iorb_effr = iorb - effr
+        spread_iorb_effr = iorb - effr  # +면 IORB가 EFFR 위
 
-        # 임계값은 보수적으로 시작(너가 원하는 “기울기/가속”은 main.py에서 Δ/ΔΔ로 강화)
+        # Tightening/Stress 쪽(neg): SOFR-EFFR 급확대(현장 조달 압박)
         if abs(spread_sofr_effr) >= 0.10:
-            A = f"A: SOFR-EFFR 스프레드 {spread_sofr_effr:+.2f}% (코리더 이탈 징후)"
-            concA = "A: 코리더 스프레드 확대(자금 압력/완화 신호 가능)"
+            A_neg = f"A: SOFR-EFFR {spread_sofr_effr:+.2f}% (코리더 이탈/압박)"
+            concA = "A: 코리더 스프레드 확대(현장 자금 압박)"
+        # Easing 쪽(pos): 스프레드가 음(-)으로 크게(현장금리 완화) 가는 케이스는 드묾 → 보수적으로 둠
+        elif spread_sofr_effr <= -0.05:
+            A_pos = f"A: SOFR<EFFR {spread_sofr_effr:+.2f}% (완화/왜곡)"
+            concA = "A: 현장금리 완화/왜곡"
+        # Neutral but watch: EFFR이 IORB에 바짝(코리더 상단 밀착)
         elif spread_iorb_effr < 0.02:
-            A = f"A: EFFR가 IORB에 바짝( IORB-EFFR {spread_iorb_effr:+.2f}% )"
-            concA = "A: 코리더 상단 압박(정책/규제 톤 변화 감지 후보)"
+            A_neg = f"A: EFFR~IORB (IORB-EFFR {spread_iorb_effr:+.2f}%)"
+            concA = "A: 코리더 상단 압박(정책/규제 톤 변화 후보)"
         else:
-            A = "A: Policy corridor 정상 범위"
-            concA = "A: 정책 코리더 정상(압력 징후 약함)"
+            concA = "A: 정책 코리더 정상(압력 약함)"
 
-    # -------- B) RRP / TGA / Reserves --------
-    # 방향성이 핵심이라 “레벨”은 결론에만
-    B = "B: None"
+    # =========================================================
+    # B) ONRRP / TGA / RESERVES (Δ/ΔΔ 중심)
+    # =========================================================
+    B_pos = "B: None"
+    B_neg = "B: None"
     concB = "B: 데이터 없음"
-    if (onrrp is not None) and (tga is not None) and (reserves is not None):
-        B = f"B: ONRRP={onrrp:,.0f} | TGA={tga:,.0f} | RES={reserves:,.0f}"
-        concB = "B: 레벨 갱신(Δ/ΔΔ는 다음 라운드에서 알람 기준으로 씀)"
 
-    # -------- C) Repo spread / Turn-end spikes --------
-    C = "C: None"
-    concC = "C: 데이터 없음"
-    if (bgcr is not None) and (sofr is not None):
-        repo_spread = bgcr - sofr
-        if abs(repo_spread) >= 0.10:
-            C = f"C: BGCR-SOFR {repo_spread:+.2f}% (담보/현금 타이트 징후)"
-            concC = "C: 레포 스프레드 확대(현장 담보/현금 불균형)"
+    # 임계치 (단위: Millions of $)
+    # 25,000 = $25B / 50,000 = $50B
+    BIG = 50_000
+    MID = 25_000
+
+    if (onrrp is not None) and (tga is not None) and (reserves is not None) and \
+       (d_onrrp is not None) and (d_tga is not None) and (d_res is not None):
+
+        # 해석:
+        # - ONRRP 감소(자금이 시장으로) + RES 증가 => 완화(positive)
+        # - TGA 증가(재무부가 유동성 흡수) + RES 감소 => 긴축(negative)
+        # - ΔΔ(가속)이 크면 “급변”
+        pos_hits = []
+        neg_hits = []
+
+        # ONRRP drain → easing 후보
+        if d_onrrp <= -MID:
+            pos_hits.append(f"ONRRP↓ {d_onrrp/1000:+.1f}B")
+        if d2_onrrp is not None and abs(d2_onrrp) >= MID:
+            # 가속 자체는 방향보다 "급변" 강조
+            if d2_onrrp < 0:
+                pos_hits.append(f"ONRRPΔΔ↓ {d2_onrrp/1000:+.1f}B")
+            else:
+                neg_hits.append(f"ONRRPΔΔ↑ {d2_onrrp/1000:+.1f}B")
+
+        # TGA build → tightening 후보
+        if d_tga >= MID:
+            neg_hits.append(f"TGA↑ {d_tga/1000:+.1f}B")
+        if d2_tga is not None and abs(d2_tga) >= MID:
+            if d2_tga > 0:
+                neg_hits.append(f"TGAΔΔ↑ {d2_tga/1000:+.1f}B")
+            else:
+                pos_hits.append(f"TGAΔΔ↓ {d2_tga/1000:+.1f}B")
+
+        # Reserves move
+        if d_res >= MID:
+            pos_hits.append(f"RES↑ {d_res/1000:+.1f}B")
+        if d_res <= -MID:
+            neg_hits.append(f"RES↓ {d_res/1000:+.1f}B")
+        if d2_res is not None and abs(d2_res) >= MID:
+            if d2_res > 0:
+                pos_hits.append(f"RESΔΔ↑ {d2_res/1000:+.1f}B")
+            else:
+                neg_hits.append(f"RESΔΔ↓ {d2_res/1000:+.1f}B")
+
+        # “브리지” 패턴: 더 강한 신호
+        if (d_onrrp <= -MID) and (d_res >= MID):
+            pos_hits.append("BRIDGE: RRP→RES(완화)")
+        if (d_tga >= MID) and (d_res <= -MID):
+            neg_hits.append("BRIDGE: TGA↑+RES↓(긴축)")
+
+        if pos_hits:
+            B_pos = "B: " + ", ".join(pos_hits)
+        if neg_hits:
+            B_neg = "B: " + ", ".join(neg_hits)
+
+        if ("BRIDGE: RRP→RES(완화)" in (B_pos or "")) or (d_onrrp <= -BIG) or (d_res >= BIG):
+            concB = "B: 단기 유동성 완화(흡수통→준비금 브리지/급변)"
+        elif ("BRIDGE: TGA↑+RES↓(긴축)" in (B_neg or "")) or (d_tga >= BIG) or (d_res <= -BIG):
+            concB = "B: 단기 유동성 긴축(재무부 흡수/준비금 감소 급변)"
         else:
-            C = f"C: BGCR-SOFR {repo_spread:+.2f}%"
-            concC = "C: 레포 스프레드 안정"
+            concB = "B: 레벨 갱신(급변 없음)"
 
-    # 트리거 문자열(한 줄)
-    trigger_line = f"{A} | {B} | {C}"
-    conclusion = f"{concA} / {concB} / {concC}"
+    # =========================================================
+    # C) BGCR – SOFR (스프레드 + Δ/ΔΔ)
+    # =========================================================
+    C_pos = "C: None"
+    C_neg = "C: None"
+    concC = "C: 데이터 없음"
 
-    return trigger_line, conclusion, liq
+    # bp 기준: 0.01% = 1bp, 0.10% = 10bp
+    if (spread_bgcr_sofr is not None) and (d_spread is not None) and (d2_spread is not None):
+        repo_spread = spread_bgcr_sofr
+
+        # 레벨 기반 스트레스(neg)
+        if abs(repo_spread) >= 0.10:
+            C_neg = f"C: BGCR-SOFR {repo_spread:+.2f}% (레포/담보 타이트)"
+            concC = "C: 레포 스프레드 확대(담보/현금 불균형)"
+        else:
+            # “급변”은 Δ/ΔΔ로 잡기: 5bp(0.05%) 이상이면 의미있는 점프
+            jump = 0.05
+            if d_spread >= jump or d2_spread >= jump:
+                C_neg = f"C: 스프레드 급등 Δ{d_spread:+.2f}% ΔΔ{d2_spread:+.2f}%"
+                concC = "C: 레포 스프레드 급등(턴엔드/담보 타이트 후보)"
+            elif d_spread <= -jump or d2_spread <= -jump:
+                C_pos = f"C: 스프레드 급락 Δ{d_spread:+.2f}% ΔΔ{d2_spread:+.2f}%"
+                concC = "C: 레포 스프레드 완화(현장 타이트 해소)"
+            else:
+                concC = "C: 레포 스프레드 안정"
+
+    # =========================================================
+    # 출력 포맷 (네 main.py가 그대로 쓰게)
+    # =========================================================
+    posL = f"{A_pos} | {B_pos} | {C_pos}"
+    negL = f"{A_neg} | {B_neg} | {C_neg}"
+
+    conclL = f"{concA} / {concB} / {concC}"
+
+    return posL, negL, conclL, liq
