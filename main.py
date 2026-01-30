@@ -1,228 +1,168 @@
 # main.py
 import os
-import json
-import time
+import math
 import requests
-from math import log, sqrt
+from typing import Dict, Any, Optional, List
 
 from fred import liquidity_canary
-
-STATE_PATH = "/tmp/state.json"
-
-
-# --------- (옵션) analyzer.regime 있으면 사용 ---------
-def _regime_fallback(m: dict) -> str:
-    # 아주 단순: VOL/ACC 기반
-    vol = m.get("VOL")
-    acc = m.get("ACC")
-    if vol is None or acc is None:
-        return "Neutral"
-    if vol >= 2.0 and acc < 0:
-        return "Risk-Off"
-    if vol >= 2.0 and acc > 0:
-        return "Risk-On"
-    return "Neutral"
+from sources import get_crypto_prices_usd
+from features import slope_acc
+from state import load_state, save_state
+from analyzer import regime
 
 
-try:
-    from analyzer import regime as analyzer_regime
-except Exception:
-    analyzer_regime = None
-
-
-def regime(m: dict) -> str:
-    if analyzer_regime:
-        try:
-            return analyzer_regime(m)
-        except Exception:
-            return _regime_fallback(m)
-    return _regime_fallback(m)
-
-
-# --------- Telegram sender ---------
-def send(msg: str):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+def send_telegram(text: str) -> bool:
+    token = os.getenv("TG_BOT_TOKEN")
+    chat_id = os.getenv("TG_CHAT_ID")
     if not token or not chat_id:
-        # 텔레그램 미설정이면 로그로만
-        print(msg)
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": msg}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
     try:
         r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
-    except Exception as e:
-        print("send() failed:", e)
-        print(msg)
-
-
-# --------- Price + simple momentum (BTC 5m return, VOL z, ACC) ---------
-def _load_state():
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return True
     except Exception:
-        return {}
+        return False
 
 
-def _save_state(s: dict):
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f)
-    except Exception:
-        pass
+def _roll_push(arr: List[float], x: float, maxlen: int) -> List[float]:
+    arr = list(arr or [])
+    arr.append(float(x))
+    if len(arr) > maxlen:
+        arr = arr[-maxlen:]
+    return arr
 
 
-def _coingecko_price(coin_id: str) -> float | None:
-    # Render에서는 외부 요청 가능. (키 필요 없음)
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": coin_id, "vs_currencies": "usd"}
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        return float(r.json()[coin_id]["usd"])
-    except Exception:
-        return None
-
-
-def _zscore(xs):
-    if len(xs) < 10:
-        return None
+def _std(xs: List[float]) -> float:
+    if not xs or len(xs) < 2:
+        return 0.0
     m = sum(xs) / len(xs)
     v = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
-    sd = sqrt(v) if v > 0 else 0.0
-    if sd == 0:
-        return 0.0
-    return (xs[-1] - m) / sd
+    return math.sqrt(v)
 
 
-def run():
-    # --------- crypto metrics ---------
-    st = _load_state()
-    now = int(time.time())
-
-    btc = _coingecko_price("bitcoin")
-    eth = _coingecko_price("ethereum")
-
-    # price history (keep last ~200 points)
-    hist = st.get("hist", [])
-    if btc is not None:
-        hist.append({"t": now, "btc": btc, "eth": eth})
-        hist = hist[-200:]
-        st["hist"] = hist
-        _save_state(st)
-
-    # BTC_R5: last-to-prev sample return (percent)
-    r5 = 0.0
-    eth_r5 = 0.0
-    vol_z = 0.0
-    acc = 0.0
-
-    if len(hist) >= 2 and hist[-1].get("btc") and hist[-2].get("btc"):
-        p0 = float(hist[-2]["btc"])
-        p1 = float(hist[-1]["btc"])
-        r5 = (p1 / p0 - 1.0) * 100.0
-
-    if len(hist) >= 2 and hist[-1].get("eth") and hist[-2].get("eth"):
-        e0 = hist[-2].get("eth")
-        e1 = hist[-1].get("eth")
-        if e0 and e1:
-            eth_r5 = (float(e1) / float(e0) - 1.0) * 100.0
-
-    # VOL: zscore of log returns of BTC
-    rets = []
-    for i in range(1, len(hist)):
-        a = hist[i - 1].get("btc")
-        b = hist[i].get("btc")
-        if a and b and float(a) > 0 and float(b) > 0:
-            rets.append(log(float(b) / float(a)))
-    vz = _zscore(rets)
-    vol_z = float(vz) if vz is not None else 0.0
-
-    # ACC: second difference of log price (proxy acceleration)
-    if len(hist) >= 3:
-        pA = hist[-3].get("btc")
-        pB = hist[-2].get("btc")
-        pC = hist[-1].get("btc")
-        if pA and pB and pC and float(pA) > 0 and float(pB) > 0 and float(pC) > 0:
-            d1 = log(float(pB) / float(pA))
-            d2 = log(float(pC) / float(pB))
-            acc = (d2 - d1)
-
-    # --------- Liquidity Canary (A/B/C) ---------
-    # ✅ 여기서 “항상 3개”만 받는다 (에러 방지 핵심)
+def run() -> None:
+    # 1) Liquidity (A/B/C/D/E)
     trigger_line, conclusion, liq = liquidity_canary()
 
-    # analyzer.regime()이 내부에서 특정 키를 요구할 수 있어 안전하게 넣어줌
-    m = {
-        "BTC_R5": r5,
-        "ETH_R5": eth_r5,
-        "VOL": vol_z,
-        "ACC": acc,
+    # 2) Crypto prices
+    px = get_crypto_prices_usd()
+    btc = px.get("BTC")
+    eth = px.get("ETH")
+
+    # 3) Load state (for momentum)
+    state = load_state()
+    mom = state.get("momentum", {})
+    if not isinstance(mom, dict):
+        mom = {}
+
+    btc_hist = mom.get("btc_hist", [])
+    eth_hist = mom.get("eth_hist", [])
+    ret_hist = mom.get("btc_ret_hist", [])
+
+    # update histories
+    if btc is not None:
+        btc_hist = _roll_push(btc_hist, btc, 30)
+    if eth is not None:
+        eth_hist = _roll_push(eth_hist, eth, 30)
+
+    # compute BTC_R5 using 5-step ago
+    r5 = 0.0
+    if btc is not None and len(btc_hist) >= 6:
+        p_now = btc_hist[-1]
+        p_5 = btc_hist[-6]
+        if p_5 != 0:
+            r5 = (p_now / p_5 - 1.0) * 100.0
+
+    # compute 1-step return for vol/acc
+    r1 = 0.0
+    if btc is not None and len(btc_hist) >= 2:
+        p0 = btc_hist[-2]
+        p1 = btc_hist[-1]
+        if p0 != 0:
+            r1 = (p1 / p0 - 1.0) * 100.0
+
+    ret_hist = _roll_push(ret_hist, r1, 25)
+    vol = _std(ret_hist)  # σ of 1-step returns (simple)
+    # acceleration: change in r1 (slope of return)
+    acc = 0.0
+    if len(ret_hist) >= 2:
+        acc = ret_hist[-1] - ret_hist[-2]
+
+    # save momentum state
+    mom["btc_hist"] = btc_hist
+    mom["eth_hist"] = eth_hist
+    mom["btc_ret_hist"] = ret_hist
+    state["momentum"] = mom
+    save_state(state)
+
+    # 4) Build regime input dict
+    m: Dict[str, Any] = {
+        "BTC_R5": float(r5),
+        "VOL": float(vol),
+        "ACC": float(acc),
     }
+
+    # 5) Add liq levels into m (only non-None)
     if isinstance(liq, dict):
         for k, v in liq.items():
             if v is not None:
-                m[k] = float(v)
-                # ===== D/E slope_acc 추가 =====
-if m.get("DGS2") is not None:
-    d1, d2 = slope_acc("DGS2", float(m["DGS2"]))
-    m["DGS2_d1"] = d1
-    m["DGS2_d2"] = d2
+                try:
+                    m[k] = float(v)
+                except Exception:
+                    pass
 
-if m.get("DGS10") is not None:
-    d1, d2 = slope_acc("DGS10", float(m["DGS10"]))
-    m["DGS10_d1"] = d1
-    m["DGS10_d2"] = d2
+    # 6) slope/acc for DGS2, DGS10, DTWEX + curve(10-2)
+    # (값이 있을 때만)
+    if m.get("DGS2") is not None:
+        d1, d2 = slope_acc("DGS2", float(m["DGS2"]))
+        m["DGS2_d1"], m["DGS2_d2"] = d1, d2
 
-if m.get("DTWEX") is not None:
-    d1, d2 = slope_acc("DTWEX", float(m["DTWEX"]))
-    m["DTWEX_d1"] = d1
-    m["DTWEX_d2"] = d2
+    if m.get("DGS10") is not None:
+        d1, d2 = slope_acc("DGS10", float(m["DGS10"]))
+        m["DGS10_d1"], m["DGS10_d2"] = d1, d2
 
-# 커브(10-2)도 같이: 레벨이 둘 다 있을 때만
-if (m.get("DGS10") is not None) and (m.get("DGS2") is not None):
-    curve = float(m["DGS10"]) - float(m["DGS2"])
-    cd1, cd2 = slope_acc("UST_CURVE_10_2", curve)
-    m["UST_CURVE_10_2"] = curve
-    m["UST_CURVE_10_2_d1"] = cd1
-    m["UST_CURVE_10_2_d2"] = cd2
-# --- D/E 축: 변화(Δ)와 가속(ΔΔ) 계산 ---
-for key in ("DGS2", "DGS10", "DTWEX"):
-    v = m.get(key)
-    if v is None:
-        continue
-    d1, d2 = slope_acc(key, float(v))
-    m[key + "_d1"] = d1
-    m[key + "_d2"] = d2
+    if m.get("DTWEX") is not None:
+        d1, d2 = slope_acc("DTWEX", float(m["DTWEX"]))
+        m["DTWEX_d1"], m["DTWEX_d2"] = d1, d2
 
-# (선택) 커브(10Y-2Y)도 "축"이라서 같이 보면 훨씬 좋아
-if (m.get("DGS10") is not None) and (m.get("DGS2") is not None):
-    curve = float(m["DGS10"]) - float(m["DGS2"])
-    cd1, cd2 = slope_acc("UST_CURVE_10_2", curve)
-    m["UST_CURVE_10_2"] = curve
-    m["UST_CURVE_10_2_d1"] = cd1
-    m["UST_CURVE_10_2_d2"] = cd2
+    if (m.get("DGS10") is not None) and (m.get("DGS2") is not None):
+        curve = float(m["DGS10"]) - float(m["DGS2"])
+        cd1, cd2 = slope_acc("UST_CURVE_10_2", curve)
+        m["UST_CURVE_10_2"] = curve
+        m["UST_CURVE_10_2_d1"] = cd1
+        m["UST_CURVE_10_2_d2"] = cd2
+
+    # 7) Format message (한 번에)
+    reg = regime(m)
+
+    axis_lines = []
+    axis_lines.append(f"DGS2  Δ={m.get('DGS2_d1', 0.0):+.3f}  ΔΔ={m.get('DGS2_d2', 0.0):+.3f}")
+    axis_lines.append(f"DGS10 Δ={m.get('DGS10_d1', 0.0):+.3f}  ΔΔ={m.get('DGS10_d2', 0.0):+.3f}")
+    axis_lines.append(f"USD   Δ={m.get('DTWEX_d1', 0.0):+.3f}  ΔΔ={m.get('DTWEX_d2', 0.0):+.3f}")
+    axis_lines.append(f"10-2  Δ={m.get('UST_CURVE_10_2_d1', 0.0):+.3f}  ΔΔ={m.get('UST_CURVE_10_2_d2', 0.0):+.3f}")
+
     msg = (
-    f"[Liquidity Canary]\n"
-    f"Regime: {regime(m)}\n\n"
-    f"[Trigger]\n"
-    f"{trigger_line}\n\n"
-    f"[Momentum]\n"
-    f"BTC_R5={r5:.2f}% | VOL={vol:.2f}σ | ACC={acc:.2f}\n\n"
-    f"[Axis]\n"
-    f"DGS2 Δ={m.get('DGS2_d1', 0):+.3f}  ΔΔ={m.get('DGS2_d2', 0):+.3f}\n"
-    f"DGS10 Δ={m.get('DGS10_d1', 0):+.3f} ΔΔ={m.get('DGS10_d2', 0):+.3f}\n"
-    f"USD(DTWEX) Δ={m.get('DTWEX_d1', 0):+.3f} ΔΔ={m.get('DTWEX_d2', 0):+.3f}\n"
-    f"Curve(10-2)={m.get('UST_CURVE_10_2', 0):+.2f} "
-    f"Δ={m.get('UST_CURVE_10_2_d1', 0):+.3f} ΔΔ={m.get('UST_CURVE_10_2_d2', 0):+.3f}\n\n"
-    f"[Conclusion]\n"
-    f"{conclusion}"
-)
+        "[Liquidity Canary]\n"
+        f"Regime: {reg}\n\n"
+        "[Trigger]\n"
+        f"{trigger_line}\n\n"
+        "[Momentum]\n"
+        f"BTC_R5={r5:+.2f}% | VOL={vol:.2f}σ | ACC={acc:+.2f}\n\n"
+        "[Axis]\n"
+        + "\n".join(axis_lines)
+        + "\n\n"
+        "[Conclusion]\n"
+        f"{conclusion}"
+    )
 
-    send(msg)
+    send_telegram(msg)
 
 
 if __name__ == "__main__":
