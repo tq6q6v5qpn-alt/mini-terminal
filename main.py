@@ -46,7 +46,7 @@ def run():
     # Regime 입력용 맵
     m = {
         "BTC_R5": r5,
-        "ETH_D1": eth_d1,
+        "ETH_R5": eth_d1,
         "VOL": vol,
         "ACC": acc,
         **(liq or {}),
