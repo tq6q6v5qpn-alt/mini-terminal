@@ -1,11 +1,46 @@
-import math
+# features.py
+from typing import Any, Dict, Optional, Tuple
+from state import load_state, save_state
 
-def pct(a,b): return 0 if a==0 else (b-a)/a*100
 
-def candle_features(kl):
- c=[float(k[4]) for k in kl]
- if len(c)<3: return 0,0,0
- r5=pct(c[-2],c[-1]); prev=pct(c[-3],c[-2]); acc=r5-prev
- rets=[pct(c[i-1],c[i]) for i in range(1,len(c))]
- m=sum(rets)/len(rets); vol=(sum((x-m)**2 for x in rets)/max(1,len(rets)-1))**0.5
- return r5,vol,acc
+def _get_bucket(state: Dict[str, Any], name: str) -> Dict[str, Any]:
+    if name not in state or not isinstance(state.get(name), dict):
+        state[name] = {}
+    return state[name]
+
+
+def slope_acc(key: str, value: float) -> Tuple[float, float]:
+    """
+    d1 = 현재 - 이전
+    d2 = d1 - 이전 d1
+    상태는 /tmp/canary_state.json 에 저장
+    """
+    state = load_state()
+    bucket = _get_bucket(state, "slope_acc")
+
+    prev = bucket.get(key)
+    prev_d1 = bucket.get(f"{key}_d1")
+
+    if prev is None:
+        d1, d2 = 0.0, 0.0
+    else:
+        d1 = float(value) - float(prev)
+        if prev_d1 is None:
+            d2 = 0.0
+        else:
+            d2 = float(d1) - float(prev_d1)
+
+    bucket[key] = float(value)
+    bucket[f"{key}_d1"] = float(d1)
+
+    save_state(state)
+    return float(d1), float(d2)
+
+
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
