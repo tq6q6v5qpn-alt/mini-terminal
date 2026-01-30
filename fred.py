@@ -1,8 +1,12 @@
-# fred.py
 import os
 import requests
+from datetime import datetime, timezone, timedelta
 
+from state import get_num, set_num
+
+KST = timezone(timedelta(hours=9))
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+
 
 def latest(series_id: str):
     api_key = os.getenv("FRED_API_KEY")
@@ -26,99 +30,140 @@ def latest(series_id: str):
     v = obs[0].get("value")
     if v in (None, ".", ""):
         return None
+
     try:
         return float(v)
     except:
         return None
 
-def liquidity_snapshot():
-    ids = {
-        "SOFR": "SOFR",
-        "EFFR": "EFFR",
-        "IORB": "IORB",
-        "RRP":  "RRPONTSYD",
-        "TGA":  "WTREGEN",
-        "RESERVES": "WRESBAL",
-    }
-    out = {}
-    for k, sid in ids.items():
-        out[k] = latest(sid)
-    return out
-# fred.py (맨 아래에 추가)
 
-def liquidity_snapshot():
+def slope_acc(key: str, v: float):
     """
-    FRED에서 핵심 유동성 스냅샷을 dict로 반환
+    state에 (레벨, 1차 변화, 2차 변화)를 저장/계산
+    d1 = Δ(기울기), d2 = ΔΔ(가속)
     """
-    series = {
-        "SOFR": "SOFR",
-        "EFFR": "EFFR",
-        "IORB": "IORB",
-        "RRP": "RRPONTSYD",
-        "TGA": "WTREGEN",
-        "RES": "WRESBAL",
-        "TGCR": "TGCR",   # 가능하면 BGCR도 추가 가능
+    prev = get_num(key)
+    prev_d1 = get_num(key + "_d1")
+
+    d1 = (v - prev) if (prev is not None) else 0.0
+    d2 = (d1 - prev_d1) if (prev_d1 is not None) else 0.0
+
+    now = datetime.now(KST).isoformat()
+    set_num(key, v, now)
+    set_num(key + "_d1", d1, now)
+    return d1, d2
+
+
+# -------------------------
+# A) Policy Corridor (SOFR/EFFR/IORB) 이탈/압력
+# -------------------------
+def corridor_signals():
+    # FRED series ids (가끔 바뀌거나 다른 이름일 수 있음)
+    # 안 나오면 logs에서 series_id 에러 확인 후 여기만 고치면 됨.
+    sofr = latest("SOFR")
+    effr = latest("EFFR")
+    iorb = latest("IORB")  # 만약 None이면 FRED에서 IORB series id가 다른 것
+
+    if (sofr is None) or (effr is None) or (iorb is None):
+        return (
+            "A(Policy Corridor): None (missing series)",
+            "A(Policy Corridor): None (missing series)",
+            "A: FRED series missing (SOFR/EFFR/IORB 확인 필요)",
+            {}
+        )
+
+    # spreads (단위: %)
+    s_sofr_effr = sofr - effr
+    s_sofr_iorb = sofr - iorb
+    s_effr_iorb = effr - iorb
+
+    # Δ/ΔΔ (기울기/가속) — 네 우선순위 3종 세트
+    d1_a1, d2_a1 = slope_acc("A_SOFR_EFFR", s_sofr_effr)
+    d1_a2, d2_a2 = slope_acc("A_SOFR_IORB", s_sofr_iorb)
+    d1_a3, d2_a3 = slope_acc("A_EFFR_IORB", s_effr_iorb)
+
+    # 임계치 (bps 기준으로 보기 편하게)
+    # 0.01% = 1bp
+    TH_WIDE = 0.05   # 5bp
+    TH_SHOCK = 0.10  # 10bp
+
+    # “압력” 정의(예시):
+    # - SOFR가 EFFR/IORB 대비 급격히 위로 벌어지는 방향 + 가속(ΔΔ>0)
+    wide_1 = (s_sofr_effr >= TH_WIDE and d1_a1 > 0 and d2_a1 > 0)
+    wide_2 = (s_sofr_iorb >= TH_WIDE and d1_a2 > 0 and d2_a2 > 0)
+    shock  = (s_sofr_effr >= TH_SHOCK) or (s_sofr_iorb >= TH_SHOCK)
+
+    if shock:
+        neg = (
+            f"A⚠️ Corridor Stress: SOFR premium spike "
+            f"(SOFR-EFFR={s_sofr_effr*100:.1f}bp, SOFR-IORB={s_sofr_iorb*100:.1f}bp)"
+        )
+        pos = "A: None"
+        concl = "A: 코리더 이탈(현장 자금조달 압력) 신호가 강해짐"
+    elif wide_1 or wide_2:
+        neg = (
+            f"A⚠️ Corridor Widening: SOFR premium rising "
+            f"(Δ/ΔΔ +) | (SOFR-EFFR={s_sofr_effr*100:.1f}bp, SOFR-IORB={s_sofr_iorb*100:.1f}bp)"
+        )
+        pos = "A: None"
+        concl = "A: 코리더가 벌어지는 방향(압력 증가) — 지속 여부 관찰"
+    else:
+        pos = (
+            f"A✅ Corridor OK: spreads stable "
+            f"(SOFR-EFFR={s_sofr_effr*100:.1f}bp, SOFR-IORB={s_sofr_iorb*100:.1f}bp)"
+        )
+        neg = "A: None"
+        concl = "A: 정책 코리더 정상 범위(압력 징후 약함)"
+
+    snap = {
+        "SOFR": sofr,
+        "EFFR": effr,
+        "IORB": iorb,
+        "A_SOFR_EFFR_bp": s_sofr_effr * 100,  # bp
+        "A_SOFR_IORB_bp": s_sofr_iorb * 100,
+        "A_EFFR_IORB_bp": s_effr_iorb * 100,
+        "A_d1_SOFR_EFFR": d1_a1,
+        "A_d2_SOFR_EFFR": d2_a1,
+        "A_d1_SOFR_IORB": d1_a2,
+        "A_d2_SOFR_IORB": d2_a2,
     }
 
-    out = {}
-    for k, sid in series.items():
-        out[k] = latest(sid)
-    return out
+    return pos, neg, concl, snap
+
+
+# -------------------------
+# B) RRP / Reserves / TGA 줄다리기 (다음 단계)
+# -------------------------
+def trio_signals():
+    return "B: None", "B: None", "B: (not implemented yet)", {}
+
+
+# -------------------------
+# C) Repo spread / Turn-end spike (다음 단계)
+# -------------------------
+def repo_signals():
+    return "C: None", "C: None", "C: (not implemented yet)", {}
 
 
 def liquidity_canary():
     """
-    (+카나리아, -카나리아, 결론, raw스냅샷) 반환
-    규칙: 양/기울기/가속(Δ/ΔΔ) 우선. (초기 보수 임계값)
+    posL/negL/conclusion/liq_snapshot 을 리턴.
+    지금은 A만 진짜 신호, B/C는 자리만.
     """
-    s = liquidity_snapshot() or {}
+    posA, negA, conclA, snapA = corridor_signals()
+    posB, negB, conclB, snapB = trio_signals()
+    posC, negC, conclC, snapC = repo_signals()
 
-    sofr = s.get("SOFR")
-    iorb = s.get("IORB")
-    tgcr = s.get("TGCR")
-    rrp  = s.get("RRP")
-    tga  = s.get("TGA")
-    res  = s.get("RES")
+    # Trigger는 “부정 신호 우선”으로 잡는 게 빠르고 날카로움
+    pos = " | ".join([posA, posB, posC])
+    neg = " | ".join([negA, negB, negC])
 
-    # 스프레드(단위: %)
-    spr_sofr_iorb = (sofr - iorb) if (sofr is not None and iorb is not None) else None
-    spr_tgcr_sofr = (tgcr - sofr) if (tgcr is not None and sofr is not None) else None
+    # 결론도 A가 우선 (B/C 아직 미구현)
+    conclusion = conclA
 
-    pos = []
-    neg = []
+    snap = {}
+    snap.update(snapA or {})
+    snap.update(snapB or {})
+    snap.update(snapC or {})
 
-    # --- Negative (긴축/스트레스) ---
-    # 1) 코리더 스트레스: SOFR이 IORB 위로 밀림(>=5bp)
-    if spr_sofr_iorb is not None and spr_sofr_iorb >= 0.05:
-        neg.append(f"SOFR-IORB↑ {spr_sofr_iorb:.2f}%")
-
-    # 2) 레포 스파이크: TGCR-SOFR 스프레드(>=3bp)
-    if spr_tgcr_sofr is not None and spr_tgcr_sofr >= 0.03:
-        neg.append(f"TGCR-SOFR spike {spr_tgcr_sofr:.2f}%")
-
-    # 3) RRP↑ & Res↓ (시장→흡수통)
-    # (Δ는 main/state에 저장하는 게 더 정확하지만, 여기선 “레벨” 기반 힌트만)
-    # → Δ/ΔΔ는 다음 단계에서 slope_acc를 fred에도 연결 가능
-    # 지금은 빠르게 "레벨 신호"만 넣고 시작
-    if rrp is not None and res is not None:
-        # 레벨 자체로는 판단 약하니 결론엔 "변화 확인" 문구를 넣자
-        pass
-
-    # --- Positive (완화/리스크온) ---
-    if spr_sofr_iorb is not None and spr_sofr_iorb <= 0.01:
-        pos.append(f"SOFR-IORB tight {spr_sofr_iorb:.2f}%")
-
-    # 결론(한 줄)
-    if neg and not pos:
-        conclusion = "Liquidity: 스트레스 쪽(코리더/레포 압력) — 방어적으로 확인."
-    elif pos and not neg:
-        conclusion = "Liquidity: 완화 쪽(코리더 안정) — 리스크온 여지."
-    elif pos and neg:
-        conclusion = "Liquidity: 혼재 — 스프레드/잔액 ‘변화(Δ/ΔΔ)’로 재판정 필요."
-    else:
-        conclusion = "Liquidity: 뚜렷한 이상 없음 — 다음 업데이트에서 Δ/ΔΔ 확인."
-
-    pos_line = " + Canary: " + (" | ".join(pos) if pos else "None")
-    neg_line = " - Canary: " + (" | ".join(neg) if neg else "None")
-
-    return pos_line, neg_line, conclusion, s
+    return pos, neg, conclusion, snap
