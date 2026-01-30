@@ -166,6 +166,29 @@ def run():
         for k, v in liq.items():
             if v is not None:
                 m[k] = float(v)
+                # ===== D/E slope_acc 추가 =====
+if m.get("DGS2") is not None:
+    d1, d2 = slope_acc("DGS2", float(m["DGS2"]))
+    m["DGS2_d1"] = d1
+    m["DGS2_d2"] = d2
+
+if m.get("DGS10") is not None:
+    d1, d2 = slope_acc("DGS10", float(m["DGS10"]))
+    m["DGS10_d1"] = d1
+    m["DGS10_d2"] = d2
+
+if m.get("DTWEX") is not None:
+    d1, d2 = slope_acc("DTWEX", float(m["DTWEX"]))
+    m["DTWEX_d1"] = d1
+    m["DTWEX_d2"] = d2
+
+# 커브(10-2)도 같이: 레벨이 둘 다 있을 때만
+if (m.get("DGS10") is not None) and (m.get("DGS2") is not None):
+    curve = float(m["DGS10"]) - float(m["DGS2"])
+    cd1, cd2 = slope_acc("UST_CURVE_10_2", curve)
+    m["UST_CURVE_10_2"] = curve
+    m["UST_CURVE_10_2_d1"] = cd1
+    m["UST_CURVE_10_2_d2"] = cd2
 # --- D/E 축: 변화(Δ)와 가속(ΔΔ) 계산 ---
 for key in ("DGS2", "DGS10", "DTWEX"):
     v = m.get(key)
@@ -185,19 +208,16 @@ if (m.get("DGS10") is not None) and (m.get("DGS2") is not None):
     msg = (
     f"[Liquidity Canary]\n"
     f"Regime: {regime(m)}\n\n"
-
     f"[Trigger]\n"
     f"{trigger_line}\n\n"
-
-    f"[Axis]\n"
-    f"DGS2   Δ={m.get('DGS2_d1',0):+7.3f} | ΔΔ={m.get('DGS2_d2',0):+7.3f}\n"
-    f"DGS10  Δ={m.get('DGS10_d1',0):+7.3f} | ΔΔ={m.get('DGS10_d2',0):+7.3f}\n"
-    f"USD    Δ={m.get('DTWEX_d1',0):+7.3f} | ΔΔ={m.get('DTWEX_d2',0):+7.3f}\n"
-    f"Curve  Δ={m.get('UST_CURVE_10_2_d1',0):+7.3f} | ΔΔ={m.get('UST_CURVE_10_2_d2',0):+7.3f}\n\n"
-
     f"[Momentum]\n"
     f"BTC_R5={r5:.2f}% | VOL={vol:.2f}σ | ACC={acc:.2f}\n\n"
-
+    f"[Axis]\n"
+    f"DGS2 Δ={m.get('DGS2_d1', 0):+.3f}  ΔΔ={m.get('DGS2_d2', 0):+.3f}\n"
+    f"DGS10 Δ={m.get('DGS10_d1', 0):+.3f} ΔΔ={m.get('DGS10_d2', 0):+.3f}\n"
+    f"USD(DTWEX) Δ={m.get('DTWEX_d1', 0):+.3f} ΔΔ={m.get('DTWEX_d2', 0):+.3f}\n"
+    f"Curve(10-2)={m.get('UST_CURVE_10_2', 0):+.2f} "
+    f"Δ={m.get('UST_CURVE_10_2_d1', 0):+.3f} ΔΔ={m.get('UST_CURVE_10_2_d2', 0):+.3f}\n\n"
     f"[Conclusion]\n"
     f"{conclusion}"
 )
