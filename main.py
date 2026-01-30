@@ -1,14 +1,13 @@
 # main.py
-import json
-import os
+import os, json, time
 from typing import Any, Dict, Optional, Tuple
 
 from fred import liquidity_canary
 
-
-STATE_PATH = os.getenv("STATE_PATH", "/tmp/canary_state.json")
-AXIS4_N = int(os.getenv("AXIS4_N", "3"))  # 5분 크론이면 3회=15분 연속 유지
-
+# =======================
+# State (for slope/acc + streaks)
+# =======================
+STATE_PATH = "state.json"
 
 def _load_state() -> Dict[str, Any]:
     try:
@@ -17,16 +16,14 @@ def _load_state() -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def _save_state(s: Dict[str, Any]) -> None:
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(s, f, ensure_ascii=False)
     except Exception:
-        pass  # 크론 죽이면 안 됨
+        pass
 
-
-def _safe_float(x: Any) -> Optional[float]:
+def _safe_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
@@ -34,201 +31,241 @@ def _safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-
-def _sign(x: float) -> int:
-    if x > 0:
-        return 1
-    if x < 0:
-        return -1
-    return 0
-
-
-def _delta(key: str, v: Optional[float]) -> float:
+def slope_acc(key: str, value: float) -> Tuple[float, float]:
     """
-    값 v의 전회 대비 변화(Δ)를 저장/반환. (가속은 지금 단계에선 불필요)
+    d1 = 이번 값 - 직전 값 (기울기)
+    d2 = d1 - 직전 d1 (가속도)
     """
-    if v is None:
-        return 0.0
     s = _load_state()
-    prev = _safe_float(s.get(key))
-    s[key] = float(v)
+    prev = s.get(key)
+    prev_d1 = s.get(key + "_d1")
+
+    d1 = 0.0 if prev is None else (value - float(prev))
+    d2 = 0.0 if prev_d1 is None else (d1 - float(prev_d1))
+
+    s[key] = value
+    s[key + "_d1"] = d1
     _save_state(s)
-    if prev is None:
-        return 0.0
-    return float(v) - prev
+    return d1, d2
 
 
-def axis4_eval(liq: Dict[str, Any]) -> Tuple[bool, str, str]:
+# =======================
+# Telegram sender (optional)
+# =======================
+def send(text: str) -> None:
     """
-    4번 축(의도/방치) 평가:
-    - A/B/C 왜곡(압박/완화) 방향이 연속 N회 유지
-    - "고칠 수 있는데" 미개입은 직접 데이터로 못 보니, 여기서는 '지속성'으로 대체
-    - 비대칭 수혜(달러 강세/커브 플랫 등) 동반 시 확신 ↑
-    반환: (axis4_on, one_line_D, wait_sentence)
+    네 환경에 이미 send()가 있으면 이 함수를 삭제하고 기존 send를 쓰면 됨.
+    여기서는 안전하게 "없어도 죽지 않게" 콘솔 출력만.
     """
-    # --- 숫자 꺼내기 ---
-    sofr = _safe_float(liq.get("SOFR"))
-    effr = _safe_float(liq.get("EFFR"))
-    iorb = _safe_float(liq.get("IORB"))
+    print(text)
 
-    onrrp = _safe_float(liq.get("ONRRP"))
-    tga = _safe_float(liq.get("TGA"))
-    reserves = _safe_float(liq.get("RESERVES"))
 
-    bgcr = _safe_float(liq.get("BGCR"))
+# =======================
+# Regime: 아주 단순 버전 (너 코드에 이미 regime 있으면 교체 가능)
+# =======================
+def regime(m: Dict[str, Any]) -> str:
+    # 기본은 Neutral. (나중에 네가 더 정교화 가능)
+    return "Neutral"
 
-    dgs2 = _safe_float(liq.get("DGS2"))
-    dgs10 = _safe_float(liq.get("DGS10"))
-    dtwex = _safe_float(liq.get("DTWEX"))
 
-    # --- A: 코리더 압박 방향(타이트 + / 완화 - / 중립 0) ---
-    A_dir = 0
-    A_distort = False
+# =======================
+# Axis ON 감지(유의미 변화/차이)
+# =======================
+def detect_changes(m: Dict[str, Any]) -> Dict[str, str]:
+    """
+    반환: {"A":"...", "C":"...", "D":"..."} 처럼 켜진 축만.
+    - "켜짐" = '차이(스프레드)' 혹은 '변화(Δ)' 혹은 '가속(ΔΔ)'이 임계치 이상
+    """
+    fired: Dict[str, str] = {}
+
+    # ---- A: 정책 코리더 차이 (이미 fred에서 레벨로 판단하지만, 여기선 "차이" 자체로 ON)
+    sofr = _safe_float(m.get("SOFR"))
+    effr = _safe_float(m.get("EFFR"))
+    iorb = _safe_float(m.get("IORB"))
     if (sofr is not None) and (effr is not None) and (iorb is not None):
         spread_sofr_effr = sofr - effr
         spread_iorb_effr = iorb - effr
+        if spread_iorb_effr < 0.02:
+            fired["A"] = "A ON: EFFR가 IORB 상단에 밀착(상단 압박)"
+        elif abs(spread_sofr_effr) >= 0.10:
+            fired["A"] = "A ON: SOFR-EFFR 이탈(코리더 균열)"
 
-        # 타이트(+) 후보: EFFR가 IORB에 바짝(상단 압박) or SOFR-EFFR 크게 +
-        if (spread_iorb_effr < 0.02) or (spread_sofr_effr >= 0.10):
-            A_dir = +1
-            A_distort = True
-        # 완화(-) 후보: SOFR-EFFR 크게 -
-        elif spread_sofr_effr <= -0.10:
-            A_dir = -1
-            A_distort = True
+    # ---- B: 탱크 변화(큰 변화만)
+    TH_TANK = 50_000.0  # 단위(백만$)가 아닐 수 있어. 데이터 스케일 보고 필요시 조정
+    # 실제로는 ONRRP/TGA/RESERVES 레벨이 매우 큼. (FRED 레벨 단위가 보통 'Millions of Dollars')
+    # 그래서 변화량 임계치는 보수적으로 크게 둠:
+    TH_TANK = 20_000.0
 
-    # --- C: 레포 스프레드(타이트 + / 완화 -) ---
-    C_dir = 0
-    C_distort = False
+    for key, label in [("ONRRP", "ONRRP"), ("TGA", "TGA"), ("RESERVES", "RES")]:
+        v = _safe_float(m.get(key))
+        if v is None:
+            continue
+        d1, d2 = slope_acc(key, float(v))
+        m[key + "_d1"] = d1
+        m[key + "_d2"] = d2
+        if abs(d1) >= TH_TANK:
+            fired["B"] = f"B ON: {label} 큰 이동(Δ={d1:+.0f})"
+            break
+
+    # ---- C: 레포 스프레드 차이
+    bgcr = _safe_float(m.get("BGCR"))
     if (bgcr is not None) and (sofr is not None):
         repo_spread = bgcr - sofr
-        if repo_spread >= 0.10:
-            C_dir = +1
-            C_distort = True
-        elif repo_spread <= -0.10:
-            C_dir = -1
-            C_distort = True
+        if abs(repo_spread) >= 0.10:
+            fired["C"] = "C ON: 레포 스프레드 확대(담보/현금 불균형)"
 
-    # --- B: 탱크 3종은 '변화(Δ)'로만 간단 판정(큰 움직임만) ---
-    # 단위가 커서 임계값은 크게(초기값). 필요하면 나중에 조정.
-    B_dir = 0
-    B_distort = False
-    if (onrrp is not None) and (tga is not None) and (reserves is not None):
-        d_onrrp = _delta("B_ONRRP", onrrp)
-        d_tga = _delta("B_TGA", tga)
-        d_res = _delta("B_RES", reserves)
+    # ---- D: 금리(2Y/10Y) 변화 + 커브(10-2) 변화
+    for key in ("DGS2", "DGS10", "DTWEX"):
+        v = _safe_float(m.get(key))
+        if v is None:
+            continue
+        d1, d2 = slope_acc(key, float(v))
+        m[key + "_d1"] = d1
+        m[key + "_d2"] = d2
 
-        TH = 50_000_000_000.0  # 500억 달러 수준 변화만 잡기(초기값)
+    dgs2 = _safe_float(m.get("DGS2"))
+    dgs10 = _safe_float(m.get("DGS10"))
+    if (dgs2 is not None) and (dgs10 is not None):
+        curve = float(dgs10) - float(dgs2)
+        cd1, cd2 = slope_acc("UST_CURVE_10_2", curve)
+        m["UST_CURVE_10_2"] = curve
+        m["UST_CURVE_10_2_d1"] = cd1
+        m["UST_CURVE_10_2_d2"] = cd2
 
-        # 타이트(+) 후보: RRP 증가(현금 주차), TGA 증가(세금/발행으로 흡수), RES 감소(은행 현금 얇아짐)
-        tight_score = 0
-        if d_onrrp >= TH:
-            tight_score += 1
-        if d_tga >= TH:
-            tight_score += 1
-        if d_res <= -TH:
-            tight_score += 1
+        # 임계치(직관): 금리는 0.05~0.15 움직임이 의미. 여기선 보수적으로 0.10
+        if abs(m.get("DGS2_d1", 0.0)) >= 0.10 or abs(m.get("DGS10_d1", 0.0)) >= 0.10:
+            fired["D"] = "D ON: 금리 레벨이 빠르게 이동(리스크 프라이싱 변곡)"
+        elif abs(cd1) >= 0.10:
+            fired["D"] = "D ON: 커브(10-2) 변형(침체/성장 기대 변화)"
 
-        # 완화(-) 후보: RRP 감소(현금 풀림), TGA 감소(정부 지출), RES 증가(은행 현금 늘어남)
-        ease_score = 0
-        if d_onrrp <= -TH:
-            ease_score += 1
-        if d_tga <= -TH:
-            ease_score += 1
-        if d_res >= TH:
-            ease_score += 1
-
-        if tight_score >= 1 and tight_score > ease_score:
-            B_dir = +1
-            B_distort = True
-        elif ease_score >= 1 and ease_score > tight_score:
-            B_dir = -1
-            B_distort = True
-
-    # --- 방향 합치기: A/B/C 중 "왜곡"만 방향 투표 ---
-    dirs = []
-    if A_distort:
-        dirs.append(A_dir)
-    if B_distort:
-        dirs.append(B_dir)
-    if C_distort:
-        dirs.append(C_dir)
-
-    any_distort = len(dirs) > 0
-    net_dir = _sign(sum(dirs))  # +1 타이트 쏠림, -1 완화 쏠림, 0 혼재/중립
-
-    # --- 비대칭 수혜(프록시): USD 강세 or 커브 더 플랫/인버전(리스크에 보통 불리) ---
-    asym = False
+    # ---- E: 달러(변화)
+    dtwex = _safe_float(m.get("DTWEX"))
     if dtwex is not None:
-        d_usd = _delta("E_DTWEX", dtwex)
-        if d_usd > 0:
-            asym = True
+        if abs(m.get("DTWEX_d1", 0.0)) >= 0.30:
+            fired["E"] = "E ON: 달러 강도 급변(글로벌 유동성/리스크오프 톤)"
 
-    if (dgs10 is not None) and (dgs2 is not None):
-        curve = dgs10 - dgs2
-        d_curve = _delta("D_CURVE_10_2", curve)
-        # 커브가 더 플랫(↓)이면 긴장 프록시
-        if d_curve < 0:
-            asym = True
+    return fired
 
-    # --- 지속성(방치) 추적 ---
+
+# =======================
+# Axis4: 의도/방치(연속 유지 + 미개입)
+# =======================
+def axis4_eval(fired: Dict[str, str], m: Dict[str, Any], streak_n: int = 3) -> Tuple[str, str]:
+    """
+    D(의도/방치):
+    - A/B/C의 왜곡 신호가 N회 연속 유지되면 '방치 신호 ON' 가능성
+    - 자동 문장: '지금은 기다릴 시간이다'
+    """
     s = _load_state()
-    prev_dir = int(s.get("axis4_prev_dir", 0) or 0)
-    streak = int(s.get("axis4_streak", 0) or 0)
-
-    if any_distort and net_dir != 0 and net_dir == prev_dir:
-        streak += 1
-    elif any_distort and net_dir != 0:
-        streak = 1
-    else:
-        streak = 0
-        net_dir = 0
-
-    s["axis4_prev_dir"] = net_dir
-    s["axis4_streak"] = streak
+    # 무엇이 "왜곡"인가? A 또는 C 또는 B 큰 이동이 계속 뜨는지
+    distort = 1 if (("A" in fired) or ("C" in fired) or ("B" in fired)) else 0
+    prev_streak = int(s.get("DISTORT_STREAK", 0))
+    streak = prev_streak + 1 if distort == 1 else 0
+    s["DISTORT_STREAK"] = streak
     _save_state(s)
 
-    # --- 최종 판정 ---
-    axis4_on = (streak >= AXIS4_N) and any_distort and (net_dir != 0) and asym
+    axis4_line = ""
+    wait_line = ""
 
-    D_line = (
-        f"D(의도/방치): A/B/C 왜곡이 {streak}회 연속 유지 + ‘고칠 수 있는데’ 미개입(지속성) → "
-        f"누군가 이득 보는 구조(비대칭) 가능성 ↑"
-    )
-
-    wait_sentence = (
-        "지금은 ‘파도’가 아니라 ‘수문’ 구간(방치 신호 ON)이라, "
-        "무리한 진입보다 관찰·대기(확인 후 행동)가 유리합니다."
-    )
-
-    return axis4_on, D_line, wait_sentence
-
-
-def run():
-    trigger_line, conclusion, liq = liquidity_canary()
-
-    axis4_on, D_line, wait_sentence = axis4_eval(liq if isinstance(liq, dict) else {})
-
-    msg = (
-        "[Liquidity Canary]\n"
-        "[Trigger]\n"
-        f"{trigger_line}\n\n"
-        "[Conclusion]\n"
-        f"{conclusion}\n"
-    )
-
-    # ✅ 4번 축을 코드로 붙이기
-    if axis4_on:
-        msg += (
-            "\n[Axis-4]\n"
-            f"{D_line}\n\n"
-            "[Action]\n"
-            f"{wait_sentence}\n"
+    if streak >= streak_n:
+        axis4_line = (
+            f"D(의도/방치): A/B/C 왜곡이 {streak}회 연속 유지 → "
+            "‘고칠 수 있는데’ 미개입이면 비대칭(누군가 이득) 가능성 ↑"
+        )
+        wait_line = (
+            "지금은 ‘파도’가 아니라 ‘수문’ 구간(방치 신호 ON)이라, "
+            "무리한 진입보다 관찰·대기(확인 후 행동)가 유리합니다."
         )
     else:
-        msg += "\n[Axis-4]\nD(의도/방치): OFF (지속/비대칭 조건 미충족)\n"
+        axis4_line = f"D(의도/방치): 왜곡 연속성 낮음({streak}/{streak_n})"
+        wait_line = "지금은 신호 확정 전(관찰 우선) 구간입니다."
 
-    print(msg)
+    return axis4_line, wait_line
+
+
+# =======================
+# 역사적 직관 힌트(아키타입)
+# =======================
+def history_hint(fired: Dict[str, str], m: Dict[str, Any]) -> str:
+    """
+    엄밀한 예측이 아니라, 과거에 자주 같이 나타났던 '방향감'을 한 줄로.
+    """
+    # 우선순위: 스트레스/달러/단기금리
+    if "C" in fired and "A" in fired:
+        return "힌트: 단기자금/담보가 같이 조이기 시작하면(레포+코리더), 과거엔 ‘현금 선호↑·리스크 자산 변동성↑’ 쪽이 잦았습니다."
+    if "E" in fired and (m.get("DTWEX_d1", 0.0) > 0):
+        return "힌트: 달러 급강세는 과거에 ‘글로벌 유동성 수축·신흥/레버리지 압박’과 함께 오는 경우가 많았습니다."
+    if "D" in fired and (m.get("DGS2_d1", 0.0) > 0):
+        return "힌트: 2년물이 빨리 오르면(정책 재가격), 과거엔 ‘위험자산 숨고르기/밸류에이션 압박’ 쪽이 잦았습니다."
+    if "B" in fired:
+        return "힌트: 탱크(ONRRP/TGA/RES) 큰 이동은 ‘유동성 배관 재배치’ 신호일 수 있어, 다음 며칠의 방향이 중요합니다."
+    return "힌트: 강한 패턴 결합은 아직 약합니다. (지금은 ‘확인’이 수익/리스크를 가릅니다.)"
+
+
+# =======================
+# Run
+# =======================
+def run() -> None:
+    trigger_line, conclusion, liq = liquidity_canary()
+
+    # 기본 m
+    m: Dict[str, Any] = {}
+
+    # liq 값을 m에 반영
+    if isinstance(liq, dict):
+        for k, v in liq.items():
+            fv = _safe_float(v)
+            if fv is not None:
+                m[k] = fv
+
+    # 유의미 변화 감지
+    fired = detect_changes(m)
+
+    # 4번 축(의도/방치)
+    axis4_line, wait_line = axis4_eval(fired, m, streak_n=3)
+
+    # 역사적 직관 힌트
+    hint = history_hint(fired, m)
+
+    # 메시지 구성(줄 안맞음 방지: msg+= 방식)
+    msg = ""
+    msg += "[Liquidity Canary]\n"
+    msg += f"Regime: {regime(m)}\n\n"
+
+    msg += "[Trigger]\n"
+    msg += f"{trigger_line}\n\n"
+
+    msg += "[Fired]\n"
+    if fired:
+        for ax, text in fired.items():
+            msg += f"- {text}\n"
+    else:
+        msg += "- None (유의미한 변화 감지 없음)\n"
+    msg += "\n"
+
+    msg += "[Axis4]\n"
+    msg += f"{axis4_line}\n"
+    msg += f"{wait_line}\n\n"
+
+    msg += "[History Hint]\n"
+    msg += f"{hint}\n\n"
+
+    # D/E 숫자 요약
+    msg += "[Axis Values]\n"
+    if m.get("DGS2") is not None:
+        msg += f"DGS2={m.get('DGS2'):.2f}%  Δ={m.get('DGS2_d1',0.0):+.3f}  ΔΔ={m.get('DGS2_d2',0.0):+.3f}\n"
+    if m.get("DGS10") is not None:
+        msg += f"DGS10={m.get('DGS10'):.2f}%  Δ={m.get('DGS10_d1',0.0):+.3f}  ΔΔ={m.get('DGS10_d2',0.0):+.3f}\n"
+    if m.get("UST_CURVE_10_2") is not None:
+        msg += f"Curve(10-2)={m.get('UST_CURVE_10_2'):+.2f}%p  Δ={m.get('UST_CURVE_10_2_d1',0.0):+.3f}  ΔΔ={m.get('UST_CURVE_10_2_d2',0.0):+.3f}\n"
+    if m.get("DTWEX") is not None:
+        msg += f"USD(DTWEX)={m.get('DTWEX'):.2f}  Δ={m.get('DTWEX_d1',0.0):+.3f}  ΔΔ={m.get('DTWEX_d2',0.0):+.3f}\n"
+    msg += "\n"
+
+    msg += "[Conclusion]\n"
+    msg += f"{conclusion}"
+
+    send(msg)
 
 
 if __name__ == "__main__":
