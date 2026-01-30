@@ -16,7 +16,12 @@ SER_RESERVES = "RESBALNS"
 
 # ===== C: Repo / Collateral =====
 SER_BGCR = "BGCR"   # TGCR 안 씀
+# ===== D: UST Yield Curve =====
+SER_DGS2 = "DGS2"      # US 2Y Treasury
+SER_DGS10 = "DGS10"    # US 10Y Treasury
 
+# ===== E: USD Strength =====
+SER_DTWEX = "DTWEXBGS" # Broad USD Index
 
 def _latest(series_id: str):
     api_key = os.getenv("FRED_API_KEY")
@@ -56,6 +61,12 @@ def liquidity_snapshot():
         "TGA": _latest(SER_TGA),
         "RESERVES": _latest(SER_RESERVES),
         "BGCR": _latest(SER_BGCR),
+        # ===== D: UST Yield Curve =====
+SER_DGS2 = "DGS2"      # US 2Y Treasury
+SER_DGS10 = "DGS10"    # US 10Y Treasury
+
+# ===== E: USD Strength =====
+SER_DTWEX = "DTWEXBGS" # Broad USD Index
     }
 
 
