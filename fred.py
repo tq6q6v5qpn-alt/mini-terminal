@@ -16,6 +16,7 @@ SER_RESERVES = "RESBALNS"
 
 # ===== C: Repo / Collateral =====
 SER_BGCR = "BGCR"   # TGCR 안 씀
+
 # ===== D: UST Yield Curve =====
 SER_DGS2 = "DGS2"      # US 2Y Treasury
 SER_DGS10 = "DGS10"    # US 10Y Treasury
@@ -23,10 +24,10 @@ SER_DGS10 = "DGS10"    # US 10Y Treasury
 # ===== E: USD Strength =====
 SER_DTWEX = "DTWEXBGS" # Broad USD Index
 
+
 def _latest(series_id: str):
     api_key = os.getenv("FRED_API_KEY")
     if not api_key:
-        # 키 없으면 None으로 처리 (main이 죽지 않게)
         return None
 
     params = {
@@ -54,19 +55,25 @@ def _latest(series_id: str):
 def liquidity_snapshot():
     """raw 레벨 값 스냅샷(dict)"""
     return {
+        # A
         "SOFR": _latest(SER_SOFR),
         "EFFR": _latest(SER_EFFR),
         "IORB": _latest(SER_IORB),
+
+        # B
         "ONRRP": _latest(SER_ONRRP),
         "TGA": _latest(SER_TGA),
         "RESERVES": _latest(SER_RESERVES),
-        "BGCR": _latest(SER_BGCR),
-        # ===== D: UST Yield Curve =====
-SER_DGS2 = "DGS2"      # US 2Y Treasury
-SER_DGS10 = "DGS10"    # US 10Y Treasury
 
-# ===== E: USD Strength =====
-SER_DTWEX = "DTWEXBGS" # Broad USD Index
+        # C
+        "BGCR": _latest(SER_BGCR),
+
+        # D
+        "DGS2": _latest(SER_DGS2),
+        "DGS10": _latest(SER_DGS10),
+
+        # E
+        "DTWEX": _latest(SER_DTWEX),
     }
 
 
@@ -75,7 +82,7 @@ def liquidity_canary():
     반환값(절대 3개 고정):
       1) trigger_line (str) : "A: ... | B: ... | C: ..."
       2) conclusion   (str) : "A: ... / B: ... / C: ..."
-      3) liq          (dict): raw 레벨 스냅샷
+      3) liq          (dict): raw 레벨 스냅샷 (+ D/E 레벨도 포함)
     """
     liq = liquidity_snapshot()
 
@@ -127,5 +134,4 @@ def liquidity_canary():
 
     trigger_line = f"{A} | {B} | {C}"
     conclusion = f"{concA} / {concB} / {concC}"
-
     return trigger_line, conclusion, liq
