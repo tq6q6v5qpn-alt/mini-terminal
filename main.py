@@ -37,14 +37,13 @@ def run():
     vol = f["vol_z"]
     acc = f["acc"]
 
+    # 유동성 카나리아 (A,B,C의 출발점)
     posL, negL, conclL, liq = liquidity_canary()
 
-    # === 여기서부터: 상태 변화(Δ)만 저장/계산 ===
+    # === 상태 변화 (Δ, ΔΔ) ===
     eth_d1, eth_d2 = slope_acc("ETH", eth if eth is not None else 0.0)
 
-    # BTC_R5 / VOL / ACC도 “양/기울기/가속” 프레임으로 가려면
-    # 다음 단계에서 slope_acc로 바꿀 거고, 지금은 일단 기존 값 유지
-
+    # Regime 입력용 맵
     m = {
         "BTC_R5": r5,
         "ETH_D1": eth_d1,
@@ -53,18 +52,22 @@ def run():
         **(liq or {}),
     }
 
+    # === Trigger 선택 ===
     trigger = posL if (posL and "None" not in posL) else negL
 
-msg = (
-    f"[Liquidity Canary]\n"
-    f"Regime: {regime(m)}\n\n"
-    f"[Trigger]\n"
-    f"{trigger}\n\n"
-    f"[Momentum]\n"
-    f"BTC_R5={r5:.2f}% | VOL={vol:.2f}σ | ACC={acc:.2f}\n\n"
-    f"[Conclusion]\n"
-    f"{conclL}"
-)
+    # === 메시지 ===
+    msg = (
+        f"[Liquidity Canary]\n"
+        f"Regime: {regime(m)}\n\n"
+        f"[Trigger]\n"
+        f"{trigger}\n\n"
+        f"[Momentum]\n"
+        f"BTC_R5={r5:.2f}% | VOL={vol:.2f}σ | ACC={acc:.2f}\n\n"
+        f"[Conclusion]\n"
+        f"{conclL}"
+    )
+
+    send(msg)
     send(msg)
 
 
