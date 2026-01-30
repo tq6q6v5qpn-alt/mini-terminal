@@ -4,7 +4,7 @@ from sources import price, funding, oi, klines, btc_features
 from features import candle_features
 from analyzer import regime
 from telegram import send
-
+from fred import liquidity_snapshot
 KST = timezone(timedelta(hours=9))
 
 def d(k, v):
@@ -20,13 +20,14 @@ def run():
     r5  = f["r5"]
     vol = f["vol_z"]
     acc = f["acc"]
-
+liq = liquidity_snapshot()
     m = {
-        'BTC_R5': r5,
-        'ETH_R5': d('ETH', eth),
-        'VOL': vol,
-        'ACC': acc
-    }
+    'BTC_R5': r5,
+    'ETH_R5': d('ETH', eth),
+    'VOL': vol,
+    'ACC': acc,
+    **liq
+}
 
     msg = (
         f"Regime: {regime(m)}\n"
